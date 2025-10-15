@@ -113,7 +113,7 @@ def run_with_errors(
 
 
 
-def plot_ler_vs_p_from_stats(stats_by_p, title="Surface code d=3: LER vs p"):
+def plot_ler_vs_p_from_stats(stats_by_p, title="Surface code d=3: LER vs p", per_round=True):
     """
     Plot LER curves from precomputed stats.
 
@@ -159,12 +159,19 @@ def plot_ler_vs_p_from_stats(stats_by_p, title="Surface code d=3: LER vs p"):
     failZ  = np.array([s.get('logical_Z_fails', np.nan) for _, s in items], dtype=float)
     failE  = np.array([s.get('either_fails', np.nan) for _, s in items], dtype=float)
 
+    rate_X_per_round = np.array([s.get('rate_X_per_round', np.nan) for _, s in items], dtype=float)
+    rate_Z_per_round = np.array([s.get('rate_Z_per_round', np.nan) for _, s in items], dtype=float)
+    rate_E_per_round = np.array([s.get('rate_either_per_round', np.nan) for _, s in items], dtype=float)
+
     # Build a tidy dataframe for convenience
     df = pd.DataFrame({
         "p": ps,
         "rate_X": rate_X,
         "rate_Z": rate_Z,
         "rate_either": rate_E,
+        "rate_X_per_round": rate_X_per_round,
+        "rate_Z_per_round": rate_Z_per_round,
+        "rate_E_per_round": rate_E_per_round,
         "shots": shots,
         "logical_X_fails": failX,
         "logical_Z_fails": failZ,
@@ -174,9 +181,14 @@ def plot_ler_vs_p_from_stats(stats_by_p, title="Surface code d=3: LER vs p"):
     # Plot (log-log)
     fig = plt.figure()
     ax = fig.add_subplot(111)
-    ax.loglog(ps, rate_X, marker="o", label="Logical X rate")
-    ax.loglog(ps, rate_Z, marker="s", label="Logical Z rate")
-    ax.loglog(ps, rate_E, marker="^", label="Either logical (X or Z)")
+    if per_round:
+        ax.loglog(ps, rate_X_per_round, marker="o", label="Logical X rate")
+        ax.loglog(ps, rate_Z_per_round, marker="s", label="Logical Z rate")
+        ax.loglog(ps, rate_E_per_round, marker="^", label="Either logical (X or Z)")
+    else:
+        ax.loglog(ps, rate_X, marker="o", label="Logical X rate")
+        ax.loglog(ps, rate_Z, marker="s", label="Logical Z rate")
+        ax.loglog(ps, rate_E, marker="^", label="Either logical (X or Z)")
     ax.set_xlabel("Physical error rate p")
     ax.set_ylabel("Logical error rate (per round)")
     ax.set_title(title)
@@ -203,57 +215,75 @@ def _checks_touching_qubit(checks, n_data):
             touches[q].append(ci)
     return [sorted(v) for v in touches]
 
-def _spacetime_H(checks, n_data, T):
+def _spacetime_H(checks, n_data, T, include_time_boundaries=True):
     """
-    Build a space-time parity matrix H_det for detection events:
-    rows  : (t, check_index) for t=1..T  (i.e., events between round t-1 and t)
-    cols  : elementary error mechanisms:
-              - data error on data qubit q in layer t  (t=1..T)   → flips the two checks touching q at layer t
-              - meas. error on check i at round t      (t=1..T-1) → flips (i at layer t) and (i at layer t+1)
+    Build a space-time parity matrix H_det for detection events.
+    Rows  : (t, check_index) for t=1..T (events between round t-1 and t).
+    Cols  : error mechanisms:
+            - data error on data qubit q in layer t, t=1..T
+              -> flips the two checks touching q at layer t (one if spatial boundary)
+            - measurement error on check i at round t, t=1..T-1
+              -> flips (i at layer t) and (i at layer t+1)
+            - (optional) time-boundary errors at t=0 and t=T on check i
+              -> singleton columns that flip (i at layer 1) and (i at layer T), respectively
     """
-    nC = len(checks)                         # # checks of this type
-    row = lambda t,i: (t-1)*nC + i           # node index for layer t, check i
+    nC = len(checks)
+    def row(t, i):  # 1..T, 0..nC-1
+        return (t - 1) * nC + i
     n_rows = T * nC
 
     # Map which checks each data qubit touches
     touch = _checks_touching_qubit(checks, n_data)
 
-    data_cols = []     # each col is a list of row indices that get toggled (mod 2)
-    # Data-error columns (spatial edges in each time layer)
-    for t in range(1, T+1):
-        for q, neigh in enumerate(touch):
+    cols = []
+
+    # --- Data-error columns (spatial edges) ---
+    for t in range(1, T + 1):
+        for neigh in touch:
             if len(neigh) == 2:
                 i, j = neigh
-                data_cols.append([row(t, i), row(t, j)])
+                cols.append([row(t, i), row(t, j)])
             elif len(neigh) == 1:
-                # boundary: single detection node (boundary is the second endpoint)
-                i = neigh[0]
-                data_cols.append([row(t, i)])
+                i = neigh[0]           # spatial boundary
+                cols.append([row(t, i)])
             else:
-                # corners have one neighbor in this small patch; interiors typically have two
-                data_cols.append([])
+                cols.append([])        # (shouldn't happen for d=3 data qubits)
 
-    # Measurement-error columns (time edges)
-    meas_cols = []
-    for t in range(1, T):           # meas error in round t flips events at layers t and t+1
+    data_cols = len(cols)
+
+    # --- Measurement-error columns (time edges between layers) ---
+    for t in range(1, T):               # rounds 1..T-1 connect layers t and t+1
         for i in range(nC):
-            meas_cols.append([row(t, i), row(t+1, i)])
+            cols.append([row(t, i), row(t + 1, i)])
 
-    # Assemble H (rows x cols) over GF(2)
-    n_cols = len(data_cols) + len(meas_cols)
-    H = np.zeros((n_rows, n_cols), dtype=np.uint8)
+    meas_internal_cols = len(cols) - data_cols
 
-    c = 0
-    for idxs in data_cols:
+    # --- Time-boundary columns (first & last layer singletons) ---
+    meas_tbound_cols = 0
+    if include_time_boundaries:
+        # t = 0 boundary -> flips layer 1 node; t = T boundary -> flips layer T node
+        for i in range(nC):
+            cols.append([row(1, i)])    # first layer singleton
+        for i in range(nC):
+            cols.append([row(T, i)])    # last layer singleton
+        meas_tbound_cols = 2 * nC
+
+    # Assemble H
+    H = np.zeros((n_rows, len(cols)), dtype=np.uint8)
+    for c, idxs in enumerate(cols):
         for r in idxs:
             H[r, c] ^= 1
-        c += 1
-    for idxs in meas_cols:
-        for r in idxs:
-            H[r, c] ^= 1
-        c += 1
 
-    return H, nC
+    meta = dict(
+        nC=nC,
+        data_cols=data_cols,
+        meas_internal_cols=meas_internal_cols,
+        meas_tbound_cols=meas_tbound_cols,
+        total_cols=len(cols),
+        include_time_boundaries=include_time_boundaries,
+    )
+    return H, meta
+
 
 def build_spacetime_decoders(X_checks, Z_checks, n_data, n_rounds):
     """
@@ -300,92 +330,6 @@ def _chunks_to_round_arrays(key, n_rounds):
 def _detection_events(rounds):
     """Compute detection events d[t] = s[t] XOR s[t-1] for t=1..T."""
     return [rounds[t] ^ rounds[t-1] for t in range(1, len(rounds))]
-
-# def decode_counts_spacetime(
-#     counts,
-#     dec_Xst, dec_Zst,
-#     X_checks, Z_checks, n_data, n_rounds,
-#     X_L_support, Z_L_support
-# ):
-#     """
-#     Space-time decoding from multi-round counts.
-#     - Builds detection events for X and Z checks.
-#     - Decodes with space-time matchers dec_Xst (for X errors) and dec_Zst (for Z errors).
-#     - Aggregates estimated *data* errors across time and reports logical failure rates.
-
-#     Returns: stats dict with rates and (optionally) per-syndrome info.
-#     """
-#     T = n_rounds - 1
-#     nCz = len(Z_checks)
-#     nCx = len(X_checks)
-
-#     shots = 0
-#     failX = failZ = either = 0
-
-#     # Precompute which checks each qubit touches (to pull data-error columns back to data qubits)
-#     touch_Z = _checks_touching_qubit(Z_checks, n_data)  # for X-error aggregation
-#     touch_X = _checks_touching_qubit(X_checks, n_data)  # for Z-error aggregation
-
-#     # Column layout in H_det:  [data errors (T*n_data)]  +  [meas errors ((T-1)*nC)]
-#     def split_cols(nC):
-#         data_cols = T * n_data
-#         meas_cols = (T-1) * nC
-#         return data_cols, meas_cols
-
-#     data_cols_Z, _ = split_cols(nCz)  # for dec_Xst (built from Z checks)
-#     data_cols_X, _ = split_cols(nCx)  # for dec_Zst (built from X checks)
-
-#     for key, freq in counts.items():
-#         shots += freq
-
-#         # 1) Parse rounds
-#         mx_rounds, mz_rounds = _chunks_to_round_arrays(key, n_rounds)
-
-#         # 2) Detection events
-#         dX_layers = _detection_events(mx_rounds)  # length T, each length nCx
-#         dZ_layers = _detection_events(mz_rounds)  # length T, each length nCz
-
-#         # 3) Flatten (layer-major) to feed PyMatching
-#         dX = np.concatenate(dX_layers).astype(np.uint8)  # shape T*nCx
-#         dZ = np.concatenate(dZ_layers).astype(np.uint8)  # shape T*nCz
-
-#         # 4) Decode detection events
-#         est_X = dec_Xst.decode(dZ)  # columns correspond to: data-X at (q,t) and Z-meas errors
-#         est_Z = dec_Zst.decode(dX)  # columns correspond to: data-Z at (q,t) and X-meas errors
-
-#         # 5) Aggregate *data* error estimates across time back to data qubits
-#         #    Sum (mod 2) over time for each qubit; ignore meas-error columns.
-#         x_hat_data = np.zeros(n_data, dtype=np.uint8)
-#         z_hat_data = np.zeros(n_data, dtype=np.uint8)
-
-#         # X decoder: first T*n_data columns are data-X at (q,t)
-#         for t in range(T):
-#             off = t * n_data
-#             x_hat_data ^= est_X[off:off+n_data].astype(np.uint8)
-
-#         # Z decoder: first T*n_data columns are data-Z at (q,t)
-#         for t in range(T):
-#             off = t * n_data
-#             z_hat_data ^= est_Z[off:off+n_data].astype(np.uint8)
-
-#         # 6) Logical checks from aggregated data-error estimates
-#         logZ = int(np.bitwise_xor.reduce(x_hat_data[np.array(Z_L_support, int)])) if len(Z_L_support) else 0
-#         logX = int(np.bitwise_xor.reduce(z_hat_data[np.array(X_L_support, int)])) if len(X_L_support) else 0
-
-#         failX += logX * freq
-#         failZ += logZ * freq
-#         either += (1 if (logX or logZ) else 0) * freq
-
-#     return dict(
-#         shots=shots,
-#         logical_X_fails=int(failX),
-#         logical_Z_fails=int(failZ),
-#         either_fails=int(either),
-#         rate_X=(failX/shots) if shots else 0.0,
-#         rate_Z=(failZ/shots) if shots else 0.0,
-#         rate_either=(either/shots) if shots else 0.0,
-#         meta=dict(T=T)
-#     )
 
 def checks_to_H(checks, n_cols):
     H = np.zeros((len(checks), n_cols), dtype=np.uint8)
@@ -477,9 +421,14 @@ def decode_counts_spacetime(
         logical_X_fails=int(failX),
         logical_Z_fails=int(failZ),
         either_fails=int(either),
-        rate_X=(failX / shots) if shots else 0.0,
-        rate_Z=(failZ / shots) if shots else 0.0,
-        rate_either=(either / shots) if shots else 0.0,
+        # per-experiment (what you have already)
+        rate_X=(failX/shots) if shots else 0.0,
+        rate_Z=(failZ/shots) if shots else 0.0,
+        rate_either=(either/shots) if shots else 0.0,
+        # NEW: per-round rates (what literature usually plots)
+        rate_X_per_round=(failX/(shots*T)) if shots and T>0 else 0.0,
+        rate_Z_per_round=(failZ/(shots*T)) if shots and T>0 else 0.0,
+        rate_either_per_round=(either/(shots*T)) if shots and T>0 else 0.0,
         meta=dict(T=T)
     )
 
