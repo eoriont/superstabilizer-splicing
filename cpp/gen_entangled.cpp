@@ -7,6 +7,8 @@
 #include <cstdio>
 #include <fstream>
 #include <optional>
+#include <unordered_set>
+#include <array>
 using namespace std;
 
 // from the tannu paper
@@ -64,8 +66,52 @@ struct CircuitSettings {
     int d = 5;
     int r = 15;
     int num_superstabilizers = 0;
+    double depol1 = 0.005;
+    double depol2 = 0.01;
 };
 
+/**
+ * Qubit helpers
+ */
+static inline vector<pair<uint32_t,uint32_t>> pairwise(const vector<uint32_t>& qs) {
+    if (qs.size() % 2) throw runtime_error("odd number of targets");
+    vector<pair<uint32_t,uint32_t>> out;
+    for (size_t i=0;i<qs.size();i+=2) out.emplace_back(qs[i], qs[i+1]);
+    return out;
+}
+
+static inline std::vector<uint32_t> qubit_targets(stim::SpanRef<const stim::GateTarget> ts) {
+    std::vector<uint32_t> qs;
+    for (auto *ptr = ts.ptr_start; ptr < ts.ptr_end; ptr++) {
+        if (ptr->is_qubit_target()) {
+            qs.push_back(ptr->qubit_value());
+        }
+    }
+    return qs;
+}
+
+std::unordered_set<uint32_t> make_seam_qubits(const stim::Circuit &circuit, int d) {
+    std::unordered_set<uint32_t> seam_qubits;
+
+    // Get final coordinates for all qubits
+    auto coords = circuit.get_final_qubit_coords();
+
+    for (uint32_t q = 0; q < coords.size(); q++) {
+        const auto &coord = coords[q];
+        if (coord.size() != 2) continue;  // skip malformed coords
+
+        double x = coord[1];  // X coordinate
+        // Check if x equals d (within a small tolerance, in case of floats)
+        if (std::abs(x - d) < 1e-9) {
+            seam_qubits.insert(q);
+        }
+    }
+
+    return seam_qubits;
+}
+/**
+ * Circuit function!
+ */
 stim::Circuit gen_entangled_circuit(const stim::Circuit& src, CircuitSettings cfg) {
     // calc delay
     int req_num_epr_pairs = cfg.d - cfg.num_superstabilizers;
@@ -78,6 +124,15 @@ stim::Circuit gen_entangled_circuit(const stim::Circuit& src, CircuitSettings cf
     stim::Circuit dst;
     auto all_qubits = get_all_qubits(src);
     bool uses_repeat_blocks = false;
+
+    std::unordered_set<uint32_t> seam_qubits = make_seam_qubits(src, cfg.d);
+    // Print each qubit in ascending order
+    std::vector<uint32_t> sorted(seam_qubits.begin(), seam_qubits.end());
+    std::sort(sorted.begin(), sorted.end());
+
+    for (uint32_t q : sorted) {
+        std::cout << "  q" << q << "\n";
+    }
 
     // recursive thing to get all the repeat blocks
     std::function<void(const stim::Circuit&, stim::Circuit&)> process;
@@ -99,6 +154,44 @@ stim::Circuit gen_entangled_circuit(const stim::Circuit& src, CircuitSettings cf
                 continue;
             }
 
+            // For the CNOT depol2's, we use the multiplier if it is a remote CNOT
+            if (inst.gate_type == stim::GateType::DEPOLARIZE2) {
+                std::vector<uint32_t> qs = qubit_targets(inst.targets);
+                auto pairs = pairwise(qs);
+                std::vector<uint32_t> affected;
+                std::vector<uint32_t> unaffected;
+
+                for (auto &[q0, q1] : pairs) {
+                    bool hits_seam = seam_qubits.count(q0) || seam_qubits.count(q1);
+                    if (hits_seam) {
+                        affected.push_back(q0);
+                        affected.push_back(q1);
+                    } else {
+                        unaffected.push_back(q0);
+                        unaffected.push_back(q1);
+                    }
+                }
+
+                // Emit unaffected pairs with original p
+                if (!unaffected.empty()) {
+                    dst.safe_append_ua("DEPOLARIZE2", unaffected, cfg.depol2);
+                }
+                // Emit affected pairs with scaled p
+                if (!affected.empty()) {
+                    dst.safe_append_ua("DEPOLARIZE2", affected, cfg.depol2 * cfg.entanglement_cnot_multiplier);
+                }
+                continue;
+            }
+
+            // For depol1's, we just replace the prob
+            if (inst.gate_type == stim::GateType::DEPOLARIZE1) {
+                std::vector<uint32_t> qs = qubit_targets(inst.targets);
+
+                // Emit one new DEPOLARIZE1 instruction with the new probability
+                dst.safe_append_ua("DEPOLARIZE1", qs, cfg.depol1);
+                continue;
+            }
+
             // Original op
             dst.safe_append(inst, false);
         }
@@ -111,6 +204,10 @@ stim::Circuit gen_entangled_circuit(const stim::Circuit& src, CircuitSettings cf
     }
     return dst;
 }
+
+/**
+ * Command line interface stuff
+ */
 
 static std::string default_out_path_for(const std::string &in) {
     // Insert _ent before ".stim" if present, else append "_ent.stim"
@@ -143,6 +240,8 @@ static void print_usage(const char *prog) {
         "Options:\n"
         "  --measurement-delay-s <double>         (default 1e-9)\n"
         "  --entanglement-rate-hz <double>        (default 1e6)\n"
+        "  --depol1 <double>                      (default 0.005)\n"
+        "  --depol2 <double>                      (default 0.01)\n"
         "  --channel-capacity <int>               (default 1000)\n"
         "  --channel-length-m <double>            (default 5.0)\n"
         "  --entanglement-cnot-multiplier <double>(default 5.0)\n"
@@ -186,6 +285,14 @@ int main(int argc, char **argv) {
         } else if (arg == "--entanglement-rate-hz") {
             const char *v = need_val(arg.c_str());
             if (!parse_double(v, cfg.entanglement_rate_hz)) { std::cerr << "Bad double: " << v << "\n"; return 2; }
+            ++i;
+        } else if (arg == "--depol1") {
+            const char *v = need_val(arg.c_str());
+            if (!parse_double(v, cfg.depol1)) { std::cerr << "Bad double: " << v << "\n"; return 2; }
+            ++i;
+        } else if (arg == "--depol2") {
+            const char *v = need_val(arg.c_str());
+            if (!parse_double(v, cfg.depol2)) { std::cerr << "Bad double: " << v << "\n"; return 2; }
             ++i;
         } else if (arg == "--channel-capacity") {
             const char *v = need_val(arg.c_str());
