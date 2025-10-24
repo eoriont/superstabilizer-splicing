@@ -5,6 +5,8 @@
 #include "stim/simulators/tableau_simulator.h"
 #include <iostream>
 #include <cstdio>
+#include <fstream>
+#include <optional>
 using namespace std;
 
 // from the tannu paper
@@ -53,31 +55,36 @@ std::vector<uint32_t> get_all_qubits(const stim::Circuit &circuit) {
     return std::vector<uint32_t>(qubit_set.begin(), qubit_set.end());
 }
 
-
-stim::Circuit gen_entangled_circuit(const stim::Circuit& src, int d, int r, int num_superstabilizers){//, int center_line=-1) {
-    // parameters
-    double meas_delay_s = 1e-9;  // adjust to your units
-    double ent_rate_hz  = 1e6;
-    int    channel_cap  = 1000;
-    double channel_length_m  = 5;
+struct CircuitSettings {
+    double measurement_delay_s = 1e-9;
+    double entanglement_rate_hz = 1e6;
+    int    channel_capacity = 1000;
+    double channel_length_m = 5;
     double entanglement_cnot_multiplier = 5.0;
+    int d = 5;
+    int r = 15;
+    int num_superstabilizers = 0;
+};
 
+stim::Circuit gen_entangled_circuit(const stim::Circuit& src, CircuitSettings cfg) {
     // calc delay
-    int req_num_epr_pairs = d - num_superstabilizers;
-    double epr_delay_s = calc_epr_delay_s(channel_length_m, req_num_epr_pairs, channel_cap, ent_rate_hz);
-    double delay = max(epr_delay_s, meas_delay_s);
+    int req_num_epr_pairs = cfg.d - cfg.num_superstabilizers;
+    double epr_delay_s = calc_epr_delay_s(cfg.channel_length_m, req_num_epr_pairs, cfg.channel_capacity, cfg.entanglement_rate_hz);
+    double delay = max(epr_delay_s, cfg.measurement_delay_s);
 
-    // calc depol rates
+    // calc depol rates (px,py,pz)
     auto dep = depol_from_delay(delay);
 
     stim::Circuit dst;
     auto all_qubits = get_all_qubits(src);
+    bool uses_repeat_blocks = false;
 
     // recursive thing to get all the repeat blocks
     std::function<void(const stim::Circuit&, stim::Circuit&)> process;
-    process = [&](const stim::Circuit &s, stim::Circuit &out) {
+    process = [&](const stim::Circuit &src, stim::Circuit &dst) {
         for (const auto &inst : src.operations) {
             if (inst.gate_type == stim::GateType::REPEAT) {
+                uses_repeat_blocks = true;
                 uint64_t reps = inst.repeat_block_rep_count();
                 stim::Circuit body_out;
 
@@ -85,48 +92,180 @@ stim::Circuit gen_entangled_circuit(const stim::Circuit& src, int d, int r, int 
                 // doesn't really matter for check qubits since they get reset
                 // but for data it could introduce logical errors.
                 body_out.safe_append_u("PAULI_CHANNEL_1", all_qubits, dep);
+
+                // recurse
                 process(inst.repeat_block_body(src), body_out);
                 dst.append_repeat_block(reps, body_out, "");  // empty tag ok
                 continue;
             }
 
             // Original op
-            out.safe_append(inst, false);
+            dst.safe_append(inst, false);
         }
     };
 
     process(src, dst);
+
+    if (!uses_repeat_blocks) {
+        throw std::runtime_error("No repeat blocks found. Input stim file must use repeat blocks for the error injection to work.");
+    }
     return dst;
+}
+
+static std::string default_out_path_for(const std::string &in) {
+    // Insert _ent before ".stim" if present, else append "_ent.stim"
+    auto pos = in.rfind(".stim");
+    if (pos != std::string::npos && pos == in.size() - 5) {
+        return in.substr(0, pos) + "_ent.stim";
+    }
+    return in + "_ent.stim";
+}
+
+static bool parse_double(const char *s, double &val) {
+    char *end = nullptr;
+    double v = std::strtod(s, &end);
+    if (!end || *end != '\0') return false;
+    val = v;
+    return true;
+}
+
+static bool parse_int(const char *s, int &val) {
+    char *end = nullptr;
+    long v = std::strtol(s, &end, 10);
+    if (!end || *end != '\0') return false;
+    val = static_cast<int>(v);
+    return true;
+}
+
+static void print_usage(const char *prog) {
+    std::cerr <<
+        "Usage: " << prog << " <path_to_circuit.stim> [options]\n"
+        "Options:\n"
+        "  --measurement-delay-s <double>         (default 1e-9)\n"
+        "  --entanglement-rate-hz <double>        (default 1e6)\n"
+        "  --channel-capacity <int>               (default 1000)\n"
+        "  --channel-length-m <double>            (default 5.0)\n"
+        "  --entanglement-cnot-multiplier <double>(default 5.0)\n"
+        "  --d <int>                              (default 5)\n"
+        "  --r <int>                              (default 15)\n"
+        "  --num-superstabilizers <int>           (default 0)\n"
+        "  -o, --output <path>                    (default: input with _ent.stim)\n"
+        "  -h, --help\n";
 }
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " <path_to_circuit.stim>\n";
+        print_usage(argv[0]);
         return 1;
     }
 
-    const char *path = argv[1];
-    FILE *f = fopen(path, "r");
+    // required input path may be first non-flag argument
+    std::string input_path;
+    CircuitSettings cfg;
+    std::string out_path;
+
+    // simple flag parsing
+    for (int i = 1; i < argc; ) {
+        std::string arg = argv[i];
+
+        auto need_val = [&](const char *name) -> const char* {
+            if (i + 1 >= argc) {
+                std::cerr << "Missing value for " << name << "\n";
+                std::exit(2);
+            }
+            return argv[++i];
+        };
+
+        if (arg == "-h" || arg == "--help") {
+            print_usage(argv[0]);
+            return 0;
+        } else if (arg == "--measurement-delay-s") {
+            const char *v = need_val(arg.c_str());
+            if (!parse_double(v, cfg.measurement_delay_s)) { std::cerr << "Bad double: " << v << "\n"; return 2; }
+            ++i;
+        } else if (arg == "--entanglement-rate-hz") {
+            const char *v = need_val(arg.c_str());
+            if (!parse_double(v, cfg.entanglement_rate_hz)) { std::cerr << "Bad double: " << v << "\n"; return 2; }
+            ++i;
+        } else if (arg == "--channel-capacity") {
+            const char *v = need_val(arg.c_str());
+            if (!parse_int(v, cfg.channel_capacity)) { std::cerr << "Bad int: " << v << "\n"; return 2; }
+            ++i;
+        } else if (arg == "--channel-length-m") {
+            const char *v = need_val(arg.c_str());
+            if (!parse_double(v, cfg.channel_length_m)) { std::cerr << "Bad double: " << v << "\n"; return 2; }
+            ++i;
+        } else if (arg == "--entanglement-cnot-multiplier") {
+            const char *v = need_val(arg.c_str());
+            if (!parse_double(v, cfg.entanglement_cnot_multiplier)) { std::cerr << "Bad double: " << v << "\n"; return 2; }
+            ++i;
+        } else if (arg == "--d") {
+            const char *v = need_val(arg.c_str());
+            if (!parse_int(v, cfg.d)) { std::cerr << "Bad int: " << v << "\n"; return 2; }
+            ++i;
+        } else if (arg == "--r") {
+            const char *v = need_val(arg.c_str());
+            if (!parse_int(v, cfg.r)) { std::cerr << "Bad int: " << v << "\n"; return 2; }
+            ++i;
+        } else if (arg == "--num-superstabilizers") {
+            const char *v = need_val(arg.c_str());
+            if (!parse_int(v, cfg.num_superstabilizers)) { std::cerr << "Bad int: " << v << "\n"; return 2; }
+            ++i;
+        } else if (arg == "-o" || arg == "--output") {
+            out_path = need_val(arg.c_str());
+            ++i;
+        } else if (!arg.empty() && arg[0] == '-') {
+            std::cerr << "Unknown option: " << arg << "\n";
+            return 2;
+        } else {
+            // first non-flag becomes input path
+            if (input_path.empty()) {
+                input_path = arg;
+                ++i;
+            } else {
+                std::cerr << "Unexpected extra argument: " << arg << "\n";
+                return 2;
+            }
+        }
+    }
+
+    if (input_path.empty()) {
+        std::cerr << "Missing <path_to_circuit.stim>\n";
+        print_usage(argv[0]);
+        return 1;
+    }
+    if (out_path.empty()) {
+        out_path = default_out_path_for(input_path);
+    }
+
+    FILE *f = std::fopen(input_path.c_str(), "r");
     if (!f) {
-        std::cerr << "Error: could not open file '" << path << "'\n";
+        std::cerr << "Error: could not open file '" << input_path << "'\n";
         return 1;
     }
 
     try {
         stim::Circuit circuit = stim::Circuit::from_file(f);
-        fclose(f);  // important: close after loading
+        std::fclose(f);  // close after loading
 
         std::cout << "Loaded circuit with "
-                  << circuit.count_qubits() << " qubits\n.";
+                  << circuit.count_qubits() << " qubits.\n";
 
-        std::mt19937_64 rng(0);
-        stim::TableauSimulator<64> sim(std::move(rng));
-        sim.safe_do_circuit(circuit, 1);
+        stim::Circuit new_circ = gen_entangled_circuit(circuit, cfg);
 
-        std::cout << "Simulation complete!\n";
+        // Save to file
+        std::ofstream out(out_path);
+        if (!out) {
+            std::cerr << "Error: could not open output file '" << out_path << "' for writing\n";
+            return 1;
+        }
+        out << new_circ;
+        out.close();
+
+        std::cout << "Wrote entangled circuit to: " << out_path << "\n";
     } catch (const std::exception &ex) {
         std::cerr << "Stim error: " << ex.what() << "\n";
-        fclose(f);
+        std::fclose(f);  // in case exception before fclose above
         return 1;
     }
 
