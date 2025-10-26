@@ -9,6 +9,7 @@
 #include <optional>
 #include <unordered_set>
 #include <array>
+#include <set>
 using namespace std;
 
 // from the tannu paper
@@ -63,9 +64,6 @@ struct CircuitSettings {
     int    channel_capacity = 1000;
     double channel_length_m = 5;
     double entanglement_cnot_multiplier = 5.0;
-    int d = 5;
-    int r = 15;
-    int num_superstabilizers = 0;
     double depol1 = 0.005;
     double depol2 = 0.01;
 };
@@ -109,12 +107,59 @@ std::unordered_set<uint32_t> make_seam_qubits(const stim::Circuit &circuit, int 
 
     return seam_qubits;
 }
+
+std::vector<uint32_t> find_deform_qubits(const stim::Circuit &circuit, int d) {
+    auto coords = circuit.get_final_qubit_coords();
+
+    const size_t limit = std::min<size_t>(coords.size(), size_t(d) * size_t(d));
+    std::vector<uint32_t> deform;
+    deform.reserve(limit);
+
+    for (uint32_t q = 0; q < limit; ++q) {
+        if (coords[q].empty()) {
+            deform.push_back(q);
+        }
+    }
+    return deform;
+}
+
+
+int infer_surface_code_distance(const stim::Circuit &circuit) {
+    auto coords = circuit.get_final_qubit_coords();
+    std::set<int> xs, ys;
+
+    for (const auto &c : coords) {
+        int x = static_cast<int>(std::round(c.second[0]));
+        int y = static_cast<int>(std::round(c.second[1]));
+        // data qubits are always at even coords
+        if (x % 2 == 0 && y % 2 == 0) {
+            xs.insert(x);
+            ys.insert(y);
+        }
+    }
+
+    if (xs.empty() || ys.empty()) {
+        throw std::runtime_error("No qubit coordinates found in circuit.");
+    }
+
+    int d_x = static_cast<int>(xs.size());
+    int d_y = static_cast<int>(ys.size());
+    return std::min(d_x, d_y);
+}
+
 /**
  * Circuit function!
  */
 stim::Circuit gen_entangled_circuit(const stim::Circuit& src, CircuitSettings cfg) {
+    // this should also be the # of superstabilizers, assuming
+    // that no deform is touching.
+    int d = infer_surface_code_distance(src);
+    auto deform_qubits = find_deform_qubits(src, d);
+    int num_superstabilizers = deform_qubits.size();
+    cout << "(d=" << d << ") and num_superstabilizers = " << num_superstabilizers << "\n";
+
     // calc delay
-    int req_num_epr_pairs = cfg.d - cfg.num_superstabilizers;
+    int req_num_epr_pairs = d - num_superstabilizers;
     double epr_delay_s = calc_epr_delay_s(cfg.channel_length_m, req_num_epr_pairs, cfg.channel_capacity, cfg.entanglement_rate_hz);
     double delay = max(epr_delay_s, cfg.measurement_delay_s);
 
@@ -125,20 +170,16 @@ stim::Circuit gen_entangled_circuit(const stim::Circuit& src, CircuitSettings cf
     auto all_qubits = get_all_qubits(src);
     bool uses_repeat_blocks = false;
 
-    std::unordered_set<uint32_t> seam_qubits = make_seam_qubits(src, cfg.d);
-    // Print each qubit in ascending order
-    std::vector<uint32_t> sorted(seam_qubits.begin(), seam_qubits.end());
-    std::sort(sorted.begin(), sorted.end());
-
-    for (uint32_t q : sorted) {
-        std::cout << "  q" << q << "\n";
-    }
+    std::unordered_set<uint32_t> seam_qubits = make_seam_qubits(src, d);
 
     // recursive thing to get all the repeat blocks
     std::function<void(const stim::Circuit&, stim::Circuit&)> process;
     process = [&](const stim::Circuit &src, stim::Circuit &dst) {
+        stim::GateType last1 = stim::GateType::NOT_A_GATE;
+        stim::GateType last2 = stim::GateType::NOT_A_GATE;
         for (const auto &inst : src.operations) {
             if (inst.gate_type == stim::GateType::REPEAT) {
+                // TODO: get # rounds here. Should be the parameter + 1 for the starting round
                 uses_repeat_blocks = true;
                 uint64_t reps = inst.repeat_block_rep_count();
                 stim::Circuit body_out;
@@ -152,6 +193,15 @@ stim::Circuit gen_entangled_circuit(const stim::Circuit& src, CircuitSettings cf
                 process(inst.repeat_block_body(src), body_out);
                 dst.append_repeat_block(reps, body_out, "");  // empty tag ok
                 continue;
+            }
+
+            // this is for the second subround for the superstabilizers.
+            if (num_superstabilizers > 0) {
+                if (inst.gate_type == stim::GateType::R &&
+                    last1 == stim::GateType::TICK &&
+                    last2 == stim::GateType::DETECTOR) {
+                    dst.safe_append_u("PAULI_CHANNEL_1", all_qubits, dep);
+                }
             }
 
             // For the CNOT depol2's, we use the multiplier if it is a remote CNOT
@@ -194,6 +244,9 @@ stim::Circuit gen_entangled_circuit(const stim::Circuit& src, CircuitSettings cf
 
             // Original op
             dst.safe_append(inst, false);
+
+            last2 = last1;
+            last1 = inst.gate_type;
         }
     };
 
@@ -245,9 +298,6 @@ static void print_usage(const char *prog) {
         "  --channel-capacity <int>               (default 1000)\n"
         "  --channel-length-m <double>            (default 5.0)\n"
         "  --entanglement-cnot-multiplier <double>(default 5.0)\n"
-        "  --d <int>                              (default 5)\n"
-        "  --r <int>                              (default 15)\n"
-        "  --num-superstabilizers <int>           (default 0)\n"
         "  -o, --output <path>                    (default: input with _ent.stim)\n"
         "  -h, --help\n";
 }
@@ -305,18 +355,6 @@ int main(int argc, char **argv) {
         } else if (arg == "--entanglement-cnot-multiplier") {
             const char *v = need_val(arg.c_str());
             if (!parse_double(v, cfg.entanglement_cnot_multiplier)) { std::cerr << "Bad double: " << v << "\n"; return 2; }
-            ++i;
-        } else if (arg == "--d") {
-            const char *v = need_val(arg.c_str());
-            if (!parse_int(v, cfg.d)) { std::cerr << "Bad int: " << v << "\n"; return 2; }
-            ++i;
-        } else if (arg == "--r") {
-            const char *v = need_val(arg.c_str());
-            if (!parse_int(v, cfg.r)) { std::cerr << "Bad int: " << v << "\n"; return 2; }
-            ++i;
-        } else if (arg == "--num-superstabilizers") {
-            const char *v = need_val(arg.c_str());
-            if (!parse_int(v, cfg.num_superstabilizers)) { std::cerr << "Bad int: " << v << "\n"; return 2; }
             ++i;
         } else if (arg == "-o" || arg == "--output") {
             out_path = need_val(arg.c_str());
