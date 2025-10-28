@@ -215,41 +215,44 @@ struct LogicalQubit {
         std::vector<MeasureQubit> syn_info;                      // all syndrome qubits
         std::vector<std::vector<int>> data_info(DD);             // data_name -> list of neighbor syn names
 
-        // dynamic boundaries: [left, right, top, bottom] as lists of data-qubit *names*
-        dynamic_boundaries = {};  // clear any previous defaults
+        // Clear edges we'll build (left, right, top, bottom)
+        std::array<std::vector<int>, 4> edges;  // 0:L,1:R,2:T,3:B
 
-        // For quick membership test of missing coords.
-        std::unordered_set<int64_t> missing;
-        missing.reserve(missing_coords.size()*2+1);
-        for (auto &c : missing_coords) missing.insert(pack(c.first, c.second));
+        // Fast membership for missing coords
+        std::unordered_set<int64_t> missing_set;
+        missing_set.reserve(missing_coords.size() * 2 + 1);
+        for (auto &c : missing_coords) {
+            // coords are stored as (2*x,2*y); pack them the same way you unpack elsewhere
+            missing_set.insert(pack(c.first, c.second));
+        }
 
-
-        // ----------------------
-        // Build data qubits grid
-        // ----------------------
+        // Build data qubits and initial dynamic boundaries (like Python)
         for (int x = 0; x < d; ++x) {
             for (int y = 0; y < d; ++y) {
                 int name = d * x + y;
                 std::pair<int,int> coords = {2 * x, 2 * y};
 
-                // Add to dynamic boundaries (by *data name*), like Python
-                if (x == 0)            dynamic_boundaries[2].push_back(name);      // top
-                else if (x == d - 1)   dynamic_boundaries[3].push_back(name);      // bottom
-                if (y == 0)            dynamic_boundaries[0].push_back(name);      // left
-                else if (y == d - 1)   dynamic_boundaries[1].push_back(name);      // right
+                // Boundaries by *grid indices*, matching Python
+                if (x == 0)        edges[2].push_back(name); // top
+                else if (x == d-1) edges[3].push_back(name); // bottom
+                if (y == 0)        edges[0].push_back(name); // left
+                else if (y == d-1) edges[1].push_back(name); // right
 
-                if (missing.count(pack(coords.first, coords.second))) {
-                    is_disabled[name] = 1; // this data qubit is disabled (needs superstabilizer)
+                if (missing_set.count(pack(coords.first, coords.second))) {
+                    is_disabled[name] = 1;  // needs superstabilizer
                 }
 
                 // Record data qubit
-                data_list[name] = DataQubit{ name, coords };
+                data_list[name] = DataQubit{name, coords};
+
+                // If data_matching stores *names*, keep this.
+                // If it stores DataQubit objects, store data_list[name] instead.
                 data_matching[coords.first][coords.second] = name;
             }
         }
 
-        // Keep a copy on the object (the active subset will be computed later)
-        this->dynamic_boundaries = dynamic_boundaries;
+        // Move into the member to avoid self-assign bugs
+        this->dynamic_boundaries = std::move(edges);
 
         // ------------------------
         // Build syndrome (X / Z)
@@ -286,7 +289,7 @@ struct LogicalQubit {
                         if (dn != -1) data_info[dn].push_back(q);
                     }
 
-                    if (missing.count(pack(sx, sy))) {
+                    if (missing_set.count(pack(sx, sy))) {
                         is_disabled[q] = 1; // defective syndrome
                     }
 
@@ -318,7 +321,7 @@ struct LogicalQubit {
                         if (dn != -1) data_info[dn].push_back(q);
                     }
 
-                    if (missing.count(pack(sx, sy))) {
+                    if (missing_set.count(pack(sx, sy))) {
                         is_disabled[q] = 1; // defective syndrome
                     }
 
@@ -934,37 +937,31 @@ struct LogicalQubit {
         // -----------------------------------------------------------------------
         for (int i = 0; i < (int)is_disabled.size(); ++i) {
             if (is_disabled[i] == 1) {
-                // skip corner indices (Python: assert i not in corners)
-                bool is_corner=false;
-                for (int k=0;k<4;k++) if (i==corners[2*k] || i==corners[2*k+1]) { is_corner=true; break; }
+                // skip the 4 corners (Python asserts "i not in corners")
+                bool is_corner = false;
+                for (int k = 0; k < 4; k++) {
+                    if (i == corners[2 * k] || i == corners[2 * k + 1]) {
+                        is_corner = true;
+                        break;
+                    }
+                }
                 if (is_corner) continue;
 
                 bool handled = handle_boundary_defects(i);
                 if (handled) {
-                    // In the Python code, after handling they do:
-                    //   handle_disconnected_qubits(only_handle_boundary=True)
-                    //   if check_remaining_qubits(): return
-                    //   boundary_invalid = update_dynamic_boundary()
-                    //   if boundary_invalid: self.percolated=True; return
-                    //
-                    // We'll plug those in after we implement those helpers.
-                    // TODO(next chunk): call boundary/disconnection update pipeline here.
-                    // 1) boundary-only disconnect cleanup
-                    handle_disconnected_qubits_boundary();
+                    // boundary-only disconnect cleanup
+                    handle_disconnected_qubits_boundary();//(/*only_handle_boundary=*/true);
 
-                    // 2) stop if too many data qubits lost
+                    // too many qubits lost?
                     if (check_remaining_qubits()) {
-                        // Constructor early exit: we've recorded the flags.
-                        return;
+                        return;  // flags already set (too_many_qubits_lost)
                     }
 
-                    // 3) recompute dynamic boundaries; if invalid -> percolated and stop
+                    // recompute dynamic boundaries; if invalid -> percolation
                     if (update_dynamic_boundary()) {
                         percolated = true;
                         return;
                     }
-
-
                 }
             }
         }
@@ -1110,7 +1107,7 @@ struct LogicalQubit {
             return true;
         };
 
-        // ========== New-boundary pass: keep handling until stable ==========
+        // ========== New-boundary pass: keep handling until stable ========== PASS 2
         {
             bool change = true;
             while (change){
@@ -1275,6 +1272,7 @@ struct LogicalQubit {
         reset_tentative_disable();
 
         // Keep deforming boundary driven by interior defects
+        // pass 3
         {
             bool change = true;
             while (change){
@@ -1477,7 +1475,8 @@ struct LogicalQubit {
             return path;
         };
 
-        bool get_metrics = true; // you can wire this to constructor arg if you want parity
+        // bool get_metrics = true; // you can wire this to constructor arg if you want parity
+        update_dynamic_boundary();
 
         if (get_metrics){
             // Vertical (top->bottom) graph using X-type connectivity
@@ -1531,42 +1530,48 @@ struct LogicalQubit {
             auto [nsp_h, len_h] = Gz.bfs_shortest_paths(-1, -2);
             horizontal_distance = (len_h>0)? (len_h - 1) : 0;
 
+        }
+
+        {
             // Observable path: top->bottom using X-type edges but NOT crossing red stabilizers
-            // (matches your G_obs: X stabilizers + X gauges; connect top/bottom)
             Graph Gobs;
             for (auto &dq : data) Gobs.add_node(dq.name);
-            Gobs.add_node(-1); Gobs.add_node(-2);
-            for (auto &mx : x_ancilla){
+            Gobs.add_node(-1);
+            Gobs.add_node(-2);
+            for (auto &mx : x_ancilla) {
                 std::vector<int> active;
-                for (int k=0;k<4;k++){ int dn=mx.data_qubits[k]; if (dn!=-1) active.push_back(dn); }
+                for (int k = 0; k < 4; k++) {
+                    int dn = mx.data_qubits[k];
+                    if (dn != -1) active.push_back(dn);
+                }
                 add_complete_pairs(Gobs, active);
             }
-            for (auto &cl : defect){
-                for (auto &xg : cl.x_gauges){
+            for (auto &cl : defect) {
+                for (auto &xg : cl.x_gauges) {
                     std::vector<int> active;
-                    for (int k=0;k<4;k++){ int dn=xg.data_qubits[k]; if (dn!=-1) active.push_back(dn); }
+                    for (int k = 0; k < 4; k++) {
+                        int dn = xg.data_qubits[k];
+                        if (dn != -1) active.push_back(dn);
+                    }
                     add_complete_pairs(Gobs, active);
                 }
             }
             for (int q : dynamic_boundaries[2]) Gobs.add_edge(-1, q);
             for (int q : dynamic_boundaries[3]) Gobs.add_edge(-2, q);
 
-            try{
+            try {
                 auto path = bfs_one_path(Gobs, -1, -2);
-                // strip endpoints and store only data names
                 observable.clear();
-                for (size_t i=1;i+1<path.size();++i){
-                    if (path[i]>=0) observable.push_back((int)path[i]);
+                for (size_t i = 1; i + 1 < path.size(); ++i) {
+                    if (path[i] >= 0) observable.push_back((int)path[i]);
                 }
-                if (verbose){
-                    std::cerr<<"Observable path length="<<observable.size()<<"\n";
+                if (verbose) {
+                    std::cerr << "Observable path length=" << observable.size() << "\n";
                 }
             } catch (...) {
                 throw std::runtime_error("Failed to find observable path");
             }
         }
-
-
 
 
 
@@ -1691,6 +1696,8 @@ struct LogicalQubit {
 
         if (first) reset_meas_qubits(circ, "R", all_qubits);
         else       reset_meas_qubits(circ, "R", syn_except_xgauge);
+
+        circ.safe_append_u("TICK", {}, {});
 
         // H on X-ancilla and X-gauges
         {
@@ -1877,12 +1884,26 @@ struct LogicalQubit {
         }
 
         // OBSERVABLE_INCLUDE for the logical (vertical) observable
+        
+        #include <string_view>
+        using namespace std::literals;
+
         {
-            std::vector<uint32_t> tgts;
-            tgts.reserve(observable.size());
-            for (int q: observable) tgts.push_back(get_meas_rec(-1, q).data);
-            circ.safe_append_u("OBSERVABLE_INCLUDE", tgts, {0.0});
+            std::vector<stim::GateTarget> recs;
+            recs.reserve(this->observable.size());
+            for (int q : this->observable) recs.push_back(get_meas_rec(-1, q));
+
+            if (!recs.empty()) {
+                const auto &gate = stim::GATE_DATA.at("OBSERVABLE_INCLUDE");
+                std::vector<double> args_vec{0.0};
+                stim::SpanRef<const double> args(args_vec);
+                stim::SpanRef<const stim::GateTarget> tgts(recs);
+                circ.safe_append(stim::CircuitInstruction(gate.id, args, tgts, ""sv));
+            } else {
+                std::cerr << "⚠️ No targets for OBSERVABLE_INCLUDE — observable list is empty.\n";
+            }
         }
+
         return circ;
     }
 };
@@ -1902,7 +1923,7 @@ int main() {
         std::vector<std::pair<int,int>> missing_coords;
 
         // Construct logical qubit
-        LogicalQubit logi(d, readout_err, gate1_err, gate2_err, missing_coords, 0.25, /*verbose=*/true);
+        LogicalQubit logi(d, readout_err, gate1_err, gate2_err, missing_coords, 0.25, /*verbose=*/true, true);
 
         // Generate Stim circuit
         stim::Circuit circuit = logi.generate_stim(rounds);
