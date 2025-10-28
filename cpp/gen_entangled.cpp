@@ -10,7 +10,9 @@
 #include <unordered_set>
 #include <array>
 #include <set>
+#include <filesystem>
 using namespace std;
+namespace fs = std::filesystem;
 
 // from the tannu paper
 std::vector<double> depol_from_delay(double tau_s, double T1=200e-6, double T2=150e-6, double p_base=1e-3) {
@@ -259,17 +261,8 @@ stim::Circuit gen_entangled_circuit(const stim::Circuit& src, CircuitSettings cf
 }
 
 /**
- * Command line interface stuff
+ * CLI
  */
-
-static std::string default_out_path_for(const std::string &in) {
-    // Insert _ent before ".stim" if present, else append "_ent.stim"
-    auto pos = in.rfind(".stim");
-    if (pos != std::string::npos && pos == in.size() - 5) {
-        return in.substr(0, pos) + "_ent.stim";
-    }
-    return in + "_ent.stim";
-}
 
 static bool parse_double(const char *s, double &val) {
     char *end = nullptr;
@@ -298,7 +291,7 @@ static void print_usage(const char *prog) {
         "  --channel-capacity <int>               (default 1000)\n"
         "  --channel-length-m <double>            (default 5.0)\n"
         "  --entanglement-cnot-multiplier <double>(default 5.0)\n"
-        "  -o, --output <path>                    (default: input with _ent.stim)\n"
+        "  -o, --output <dir>                     (default: entangled/)\n"
         "  -h, --help\n";
 }
 
@@ -309,9 +302,9 @@ int main(int argc, char **argv) {
     }
 
     // required input path may be first non-flag argument
-    std::string input_path;
     CircuitSettings cfg;
-    std::string out_path;
+    fs::path input_path;
+    fs::path output_dir;
 
     // simple flag parsing
     for (int i = 1; i < argc; ) {
@@ -357,7 +350,7 @@ int main(int argc, char **argv) {
             if (!parse_double(v, cfg.entanglement_cnot_multiplier)) { std::cerr << "Bad double: " << v << "\n"; return 2; }
             ++i;
         } else if (arg == "-o" || arg == "--output") {
-            out_path = need_val(arg.c_str());
+            output_dir = need_val(arg.c_str());
             ++i;
         } else if (!arg.empty() && arg[0] == '-') {
             std::cerr << "Unknown option: " << arg << "\n";
@@ -379,9 +372,22 @@ int main(int argc, char **argv) {
         print_usage(argv[0]);
         return 1;
     }
-    if (out_path.empty()) {
-        out_path = default_out_path_for(input_path);
+
+    if (!fs::exists(input_path)) {
+        std::cerr << "Error: input file does not exist.\n";
+        return 1;
     }
+
+    if (output_dir.empty()) {
+        output_dir = "entangled/";
+    }
+
+    if (!fs::exists(output_dir)) {
+        std::cerr << "Warning: output folder does not exist, creating it.\n";
+        fs::create_directories(output_dir);
+    }
+    fs::path base_name = input_path.stem();     // e.g. "my_circuit"
+    fs::path output_path = output_dir / (base_name.string() + "_ent.stim");
 
     FILE *f = std::fopen(input_path.c_str(), "r");
     if (!f) {
@@ -399,15 +405,15 @@ int main(int argc, char **argv) {
         stim::Circuit new_circ = gen_entangled_circuit(circuit, cfg);
 
         // Save to file
-        std::ofstream out(out_path);
+        std::ofstream out(output_path);
         if (!out) {
-            std::cerr << "Error: could not open output file '" << out_path << "' for writing\n";
+            std::cerr << "Error: could not open output file '" << output_path << "' for writing\n";
             return 1;
         }
         out << new_circ;
         out.close();
 
-        std::cout << "Wrote entangled circuit to: " << out_path << "\n";
+        std::cout << "Wrote entangled circuit to: " << output_path << "\n";
     } catch (const std::exception &ex) {
         std::cerr << "Stim error: " << ex.what() << "\n";
         std::fclose(f);  // in case exception before fclose above
