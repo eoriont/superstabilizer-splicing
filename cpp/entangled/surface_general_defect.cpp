@@ -135,12 +135,6 @@ struct Defect {
 };
 
 // Helper: convert qubit indices to GateTargets.
-// static inline std::vector<stim::GateTarget> qubit_targets(const std::vector<int> &qs){
-//     std::vector<stim::GateTarget> t;
-//     t.reserve(qs.size());
-//     for (int q: qs) t.push_back(stim::GateTarget::qubit(q));
-//     return t;
-// }
 static inline std::vector<uint32_t> qubit_targets(const std::vector<int> &qs){
     std::vector<uint32_t> t;
     t.reserve(qs.size());
@@ -175,6 +169,7 @@ struct LogicalQubit {
     // measurement bookkeeping
     // Each round: map qubit-> lookback index (negative offsets)
     std::vector<std::unordered_map<int,int64_t>> meas_record;
+    int64_t total_meas_count = 0;
 
     LogicalQubit(int d_,
                  double readout_err_, double gate1_err_, double gate2_err_,
@@ -184,16 +179,6 @@ struct LogicalQubit {
                  bool get_metrics=false)
         : d(d_), readout_err(readout_err_), gate1_err(gate1_err_), gate2_err(gate2_err_) {
 
-        // -------------------------------------------------------------------------------------
-        // TODO: Translate the Python constructor here:
-        // - Build data qubits (grid of (2x,2y)).
-        // - Build syndrome qubits, data_info, syn_info, is_disabled vector.
-        // - Handle boundary deformation / deletion logic (all those helpers).
-        // - Fill: `data`, `x_ancilla`, `z_ancilla`, `x_gauges`, `z_gauges`, `defect`,
-        //         `dynamic_boundaries`, `all_qubits`, `observable`, distances, etc.
-        //
-        // Keep the Python structure; use std::vector / std::unordered_map / std::set.
-        // -------------------------------------------------------------------------------------
         // --- small helper to pack 2D coords into a hashable key ---
         auto pack = [](int x, int y) -> int64_t {
             return ( (int64_t)x << 32 ) ^ ( (int64_t)y & 0xffffffffLL );
@@ -222,11 +207,16 @@ struct LogicalQubit {
         std::unordered_set<int64_t> missing_set;
         missing_set.reserve(missing_coords.size() * 2 + 1);
         for (auto &c : missing_coords) {
-            // coords are stored as (2*x,2*y); pack them the same way you unpack elsewhere
-            missing_set.insert(pack(c.first, c.second));
+            // coords are *physical* even grid (e.g., (4,4)), as used below
+            auto k = pack(c.first, c.second);
+            missing_set.insert(k);
         }
 
+        std::cout << "this is (4,4) packed: " << pack(4,4) << "\n";
+
+
         // Build data qubits and initial dynamic boundaries (like Python)
+        int disabled_count = 0;
         for (int x = 0; x < d; ++x) {
             for (int y = 0; y < d; ++y) {
                 int name = d * x + y;
@@ -238,18 +228,18 @@ struct LogicalQubit {
                 if (y == 0)        edges[0].push_back(name); // left
                 else if (y == d-1) edges[1].push_back(name); // right
 
+                // Disable if listed
                 if (missing_set.count(pack(coords.first, coords.second))) {
                     is_disabled[name] = 1;  // needs superstabilizer
+                    ++disabled_count;
                 }
 
                 // Record data qubit
                 data_list[name] = DataQubit{name, coords};
-
-                // If data_matching stores *names*, keep this.
-                // If it stores DataQubit objects, store data_list[name] instead.
                 data_matching[coords.first][coords.second] = name;
             }
         }
+
 
         // Move into the member to avoid self-assign bugs
         this->dynamic_boundaries = std::move(edges);
@@ -1414,6 +1404,7 @@ struct LogicalQubit {
             }
         }
 
+        // Corrected defect construction block:
         // Build defect objects from clusters
         defect.clear();
         for (size_t ci=0; ci<connected_defects.size(); ++ci){
@@ -1423,9 +1414,19 @@ struct LogicalQubit {
                 names.push_back(disabled_data_q[local_idx].name);
                 coords.push_back(disabled_data_q[local_idx].coords);
             }
+            
+            // Create maps to link the original syn_info index (si) to the actual filtered Gauge object.
+            std::unordered_map<int, MeasureQubit> filtered_gauges;
+            for (const auto& mq : x_gauges) filtered_gauges[mq.name - DD] = mq;
+            for (const auto& mq : z_gauges) filtered_gauges[mq.name - DD] = mq;
+
             std::vector<MeasureQubit> xgs, zgs;
-            for (int si : cluster_x_idx[ci]) xgs.push_back(syn_info[si]);
-            for (int si : cluster_z_idx[ci]) zgs.push_back(syn_info[si]);
+            
+            // FIX: Retrieve the filtered MeasureQubit from the map.
+            // The index si is relative to syn_info, so we need to adjust by DD for the name.
+            for (int si : cluster_x_idx[ci]) xgs.push_back(filtered_gauges.at(si));
+            for (int si : cluster_z_idx[ci]) zgs.push_back(filtered_gauges.at(si));
+            
             defect.emplace_back(names, coords, xgs, zgs);
         }
 
@@ -1649,10 +1650,16 @@ struct LogicalQubit {
                     round[qs[i]] = -k;  // -1, -2, ...
                 }
                 // shift older rounds further back by |qs|
-                for (auto &r : meas_record) {
-                    for (auto &kv : r) kv.second -= (int64_t)qs.size();
+                const int64_t shift = (int64_t)qs.size();
+                if (shift != 0) {
+                    for (auto &r : meas_record) {
+                        for (auto &kv : r) {
+                            kv.second -= shift;
+                        }
+                    }
                 }
                 meas_record.push_back(std::move(round));
+                total_meas_count += shift;
             }
         }
         if (!last && qs.size() < all_qubits.size()){
@@ -1667,7 +1674,9 @@ struct LogicalQubit {
     stim::GateTarget get_meas_rec(int round_idx, int qubit_name) const {
         // round_idx is negative in Python; interpret relative to end
         int idx = (int)meas_record.size() + round_idx;
+
         if (idx < 0 || idx >= (int)meas_record.size()) {
+            // This is where the error is thrown.
             throw std::runtime_error("get_meas_rec: round_idx out of range.");
         }
         auto it = meas_record[idx].find(qubit_name);
@@ -1736,13 +1745,13 @@ struct LogicalQubit {
             apply_1gate(circ, "H", hs);
         }
 
-        reset_meas_qubits(circ, "M", syn_except_zgauge);
+        reset_meas_qubits(circ, "M", syn_except_zgauge); // R1: X-M, R2+: X-M
 
         if (!first){
             circ.safe_append_u("SHIFT_COORDS", {}, {0.0,0.0,1.0});
-            // DETECTORs for stabilizers
+            
+            // DETECTORs for stabilizers (X and Z)
             for (auto &a: x_ancilla){
-                std::vector<int64_t> recs = {-1, -2}; // this round and previous
                 auto tgts = std::vector<uint32_t>{ get_meas_rec(-1, a.name).data, get_meas_rec(-2, a.name).data };
                 circ.safe_append_u("DETECTOR", tgts, {(double)a.coords.first, (double)a.coords.second, 0.0});
             }
@@ -1750,22 +1759,27 @@ struct LogicalQubit {
                 auto tgts = std::vector<uint32_t>{ get_meas_rec(-1, a.name).data, get_meas_rec(-2, a.name).data };
                 circ.safe_append_u("DETECTOR", tgts, {(double)a.coords.first, (double)a.coords.second, 0.0});
             }
+            
             // cluster x-gauges superstabilizer detector
             for (auto &cl: defect){
                 if (!cl.x_gauges.empty()){
                     std::vector<uint32_t> tgts;
+                    // X-Gauge: Correct Python indices for R2 X-M (size=3)
                     for (auto &xg: cl.x_gauges) tgts.push_back(get_meas_rec(-1, xg.name).data);
                     for (auto &xg: cl.x_gauges) tgts.push_back(get_meas_rec(-3, xg.name).data);
+                    
                     auto c0 = cl.coords.empty()?std::pair<int,int>{0,0}:cl.coords[0];
                     circ.safe_append_u("DETECTOR", tgts, {(double)c0.first,(double)c0.second,0.0});
                 }
             }
         } else {
+            // This part is the R1 X-M detector (correctly uses REC[-1] vs reset)
             for (auto &a: z_ancilla){
                 auto tgts = std::vector<uint32_t>{ get_meas_rec(-1, a.name).data };
-                circ.safe_append_u("DETECTOR", tgts, {(double)a.coords.first,(double)a.coords.second,0.0});
+                circ.safe_append_u("DETECTOR", tgts, {(double)a.coords.first, (double)a.coords.second, 0.0});
             }
         }
+        
         circ.safe_append_u("TICK", {}, {});
 
         if (!double_half) return circ;
@@ -1801,24 +1815,31 @@ struct LogicalQubit {
             for (auto &m: x_ancilla) hs.push_back(m.name);
             apply_1gate(circ, "H", hs);
         }
-        reset_meas_qubits(circ, "M", syn_except_xgauge);
+        reset_meas_qubits(circ, "M", syn_except_xgauge); // R1: Z-M, R2+: Z-M
         circ.safe_append_u("SHIFT_COORDS", {}, {0.0,0.0,1.0});
+        
         for (auto &a: x_ancilla){
-            auto tgts = std::vector<uint32_t>{ get_meas_rec(-1,a.name).data, get_meas_rec(-2,a.name).data };
+            auto tgts = std::vector<uint32_t>{ get_meas_rec(-1, a.name).data, get_meas_rec(-2, a.name).data };
             circ.safe_append_u("DETECTOR", tgts, {(double)a.coords.first,(double)a.coords.second,0.0});
         }
         for (auto &a: z_ancilla){
-            auto tgts = std::vector<uint32_t>{ get_meas_rec(-1,a.name).data, get_meas_rec(-2,a.name).data };
+            auto tgts = std::vector<uint32_t>{ get_meas_rec(-1, a.name).data, get_meas_rec(-2, a.name).data };
             circ.safe_append_u("DETECTOR", tgts, {(double)a.coords.first,(double)a.coords.second,0.0});
         }
-        // cluster z-gauges superstabilizer detector (depends on first/not-first; mirror Python if needed)
+        
+        // cluster z-gauges superstabilizer detector (depends on first/not-first)
         for (auto &cl: defect){
             if (!cl.z_gauges.empty()){
                 std::vector<uint32_t> tgts;
-                // if not first: {-1 and -3}; if first: only -1
-                // Here we implement the non-first case; adjust for first if you need exact parity with Python.
-                for (auto &zg: cl.z_gauges) tgts.push_back(get_meas_rec(-1, zg.name).data);
-                for (auto &zg: cl.z_gauges) tgts.push_back(get_meas_rec(-3, zg.name).data);
+                // Z-Gauge: Correct history check for REC[-3]
+                if (!first) {
+                    // Non-first: Compares R-Z[t] (at -1) with R-Z[t-1] (at -3)
+                    for (auto &zg: cl.z_gauges) tgts.push_back(get_meas_rec(-1, zg.name).data);
+                    for (auto &zg: cl.z_gauges) tgts.push_back(get_meas_rec(-3, zg.name).data);
+                } else {
+                    // First round: only one Z-gauge measurement has occurred
+                    for (auto &zg: cl.z_gauges) tgts.push_back(get_meas_rec(-1, zg.name).data);
+                }
                 auto c0 = cl.coords.empty()?std::pair<int,int>{0,0}:cl.coords[0];
                 circ.safe_append_u("DETECTOR", tgts, {(double)c0.first,(double)c0.second,0.0});
             }
@@ -1826,7 +1847,6 @@ struct LogicalQubit {
         circ.safe_append_u("TICK", {}, {});
         return circ;
     }
-
     stim::Circuit generate_stim(int rounds){
         stim::Circuit circ;
 
@@ -1867,16 +1887,21 @@ struct LogicalQubit {
             tgts.push_back(get_meas_rec(-2, a.name).data);
             circ.safe_append_u("DETECTOR", tgts, {(double)a.coords.first,(double)a.coords.second,0.0});
         }
+        
         for (auto &cl: defect){
             if (!cl.z_gauges.empty()){
                 std::vector<int> z_gauge_data_names;
                 for (auto &zg: cl.z_gauges){
                     for (int i=0;i<4;i++){
-                        if (zg.data_qubits[i]!=-1) z_gauge_data_names.push_back(zg.data_qubits[i]);
+                        if (zg.data_qubits[i]!=-1) {
+                            z_gauge_data_names.push_back(zg.data_qubits[i]);
+                        }
                     }
                 }
                 std::vector<uint32_t> tgts;
-                for (int q: z_gauge_data_names) tgts.push_back(get_meas_rec(-1, q).data);
+                for (int q: z_gauge_data_names) {
+                    tgts.push_back(get_meas_rec(-1, q).data);
+                }
                 for (auto &zg: cl.z_gauges)   tgts.push_back(get_meas_rec(-2, zg.name).data);
                 auto c0 = cl.coords.empty()?std::pair<int,int>{0,0}:cl.coords[0];
                 circ.safe_append_u("DETECTOR", tgts, {(double)c0.first,(double)c0.second,0.0});
@@ -1920,13 +1945,27 @@ int main() {
         int rounds = 10;
 
         // Example: no missing coordinates
-        std::vector<std::pair<int,int>> missing_coords;
+        std::vector<std::pair<int,int>> missing_coords = {{4, 2}, {4, 6}};
 
         // Construct logical qubit
         LogicalQubit logi(d, readout_err, gate1_err, gate2_err, missing_coords, 0.25, /*verbose=*/true, true);
 
+        std::cout << "C++ X-gauges: [";
+        for (size_t i=0; i<logi.x_gauges.size(); ++i) { 
+            if (i) std::cout << ", "; 
+            std::cout << logi.x_gauges[i].name; 
+        }
+        std::cout << "]\n";
+        std::cout << "C++ Z-gauges: [";
+        for (size_t i=0; i<logi.z_gauges.size(); ++i) { 
+            if (i) std::cout << ", "; 
+            std::cout << logi.z_gauges[i].name; 
+        }
+        std::cout << "]\n";
+
         // Generate Stim circuit
         stim::Circuit circuit = logi.generate_stim(rounds);
+        
 
         // Save to file
         std::ofstream out("logical_qubit_circuit.stim");

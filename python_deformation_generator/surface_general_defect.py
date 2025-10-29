@@ -1582,6 +1582,14 @@ class LogicalQubit:
             circ.append("DEPOLARIZE1", idle_qubits, self.gate1_err)
 
     def get_meas_rec(self, round_idx, qubit_name):
+        round_map = self.meas_record[round_idx]
+        print(qubit_name, round_map)
+        if qubit_name not in round_map:
+            print(
+                f"--- SILENT FAILURE DETECTED ---"
+                f"Qubit {qubit_name} (Gauge) NOT found in historical round {round_idx}. "
+                f"Measurement history size is {len(self.meas_record)}."
+            )
         return stim.target_rec(self.meas_record[round_idx][qubit_name])
 
     def syndrome_round(self, circ: stim.Circuit, first=False, double=False) -> None:
